@@ -1,12 +1,10 @@
 import sys
 import os
-import json
 import argparse
 import time
 import torch
 import torch_npu
 import torch.distributed as dist
-import numpy as np
 import gc  
 from PIL import Image
 import logging
