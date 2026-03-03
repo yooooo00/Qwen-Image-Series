@@ -261,7 +261,7 @@ class xFuserQwenDoubleStreamAttnProcessor(QwenDoubleStreamAttnProcessor2_0):
         head_dim = 128
         self.scale=(head_dim ** -0.5)
 
-        self.fa_alltoall_overlap = int(os.getenv('OVERLAP', 0))
+        self.fa_alltoall_overlap = bool(int(os.getenv('OVERLAP', 0)))
         self.rope_fuse = bool(int(os.environ.get('ROPE_FUSE', 0)))
 
     def __call__(
