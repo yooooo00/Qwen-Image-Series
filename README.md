@@ -62,7 +62,7 @@ pip install torch_npu-{pytorchversion}.xxxx.{arch}.whl
 
 ## 二、下载权重
 
-### 2.1 权重及配置文件说明
+### 2.1 原始权重及配置文件说明
 -  Huggingface
 
 |  模型 | 链接  |
@@ -85,6 +85,26 @@ pip install torch_npu-{pytorchversion}.xxxx.{arch}.whl
 | Qwen-Image-Edit-2509  |  [🤖 ModelScope](https://modelscope.cn/models/Qwen/Qwen-Image-Edit-2509) |
 | Qwen-Image-Edit-2511  |  [🤖 ModelScope](https://modelscope.cn/models/Qwen/Qwen-Image-Edit-2511) |
 | Qwen-Image-Layered  |  [🤖 ModelScope](https://modelscope.cn/models/Qwen/Qwen-Image-Layered) |
+
+### 2.2 蒸馏权重及配置文件说明
+-  Huggingface
+
+|  模型 | 链接  |
+| ------------ | ------------ |
+| Qwen-Image-Lightning  |  [🤗 huggingface](https://huggingface.co/lightx2v/Qwen-Image-Lightning) |
+| Qwen-Image-2512-Lightning  |  [🤗 huggingface](https://huggingface.co/lightx2v/Qwen-Image-2512-Lightning) |
+| Qwen-Image-Edit-2509-Lightning  |  [🤗 huggingface](https://huggingface.co/lightx2v/Qwen-Image-Lightning/tree/main/Qwen-Image-Edit-2509) |
+| Qwen-Image-Edit-2511-Lightning  |  [🤗 huggingface](https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning) |
+
+- ModelScope
+
+|  模型 | 链接  |
+| ------------ | ------------ |
+| Qwen-Image-Lightning  |  [🤖 ModelScope](https://www.modelscope.cn/models/lightx2v/Qwen-Image-Lightning) |
+| Qwen-Image-2512-Lightning  |  [🤖 ModelScope](https://www.modelscope.cn/models/lightx2v/Qwen-Image-2512-Lightning) |
+| Qwen-Image-Edit-2509-Lightning  |  [🤖 ModelScope](https://www.modelscope.cn/models/lightx2v/Qwen-Image-Lightning/tree/master/Qwen-Image-Edit-2509) |
+| Qwen-Image-Edit-2511-Lightning  |  [🤖 ModelScope](https://www.modelscope.cn/models/lightx2v/Qwen-Image-Edit-2511-Lightning) |
+
 ## 三、Qwen-Image使用
 
 ### 3.1 下载到本地，安装模型依赖
