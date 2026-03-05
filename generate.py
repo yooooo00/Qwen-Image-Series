@@ -409,11 +409,11 @@ def generate(args: argparse.Namespace):
     if "image" in EXAMPLE_PROMPT[args.task]:
         input_images = load_images(args.image, args.color_format)
         inputs_warm_up["image"] = input_images
-        inputs_warm_up.pop("width")
-        inputs_warm_up.pop("height")
 
     # Layered任务添加专属参数
     if args.task == "Qwen-Image-Layered":
+        inputs_warm_up.pop("width")
+        inputs_warm_up.pop("height")
         inputs_warm_up.update({
             "layers": args.layers,
             "resolution": args.resolution,
