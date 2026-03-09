@@ -31,6 +31,9 @@ SUPPORT_LIST = [
     "Qwen-Image-Layered",
     ]
 
+TEXT_TO_IMAGE_TASKS = {"Qwen-Image", "Qwen-Image-2512"}
+
+
 # 环境变量配置（带默认值和注释，用户可通过环境变量灵活控制）
 COND_CACHE = bool(int(os.environ.get('COND_CACHE', 0)))  # 条件输入缓存开关：1=启用，0=禁用
 UNCOND_CACHE = bool(int(os.environ.get('UNCOND_CACHE', 0)))  # 无条件输入缓存开关：1=启用，0=禁用
@@ -157,6 +160,52 @@ def init_pipeline(
         return QwenImageLayeredPipeline.from_pretrained(**common_kwargs)
     else:
         raise ValueError(f"不支持的任务类型：{task}，仅支持{SUPPORT_LIST}")
+
+
+def _fuse_loaded_lora(pipeline: Any):
+    fuse_attempts = (
+        {"components": ["transformer"], "safe_fusing": True},
+        {"components": ["transformer"], "safe_fuse": True},
+        {"safe_fusing": True},
+        {"safe_fuse": True},
+        {},
+    )
+
+    last_error = None
+    for kwargs in fuse_attempts:
+        try:
+            pipeline.fuse_lora(**kwargs)
+            return
+        except TypeError as exc:
+            last_error = exc
+
+    if last_error is not None:
+        raise last_error
+
+
+def _load_and_fuse_lora(pipeline: Any, lora_path: str):
+    logging.info(f"Loading LoRA weights from {lora_path}")
+    pipeline.load_lora_weights(pretrained_model_name_or_path_or_dict=lora_path)
+    _fuse_loaded_lora(pipeline)
+
+    if hasattr(pipeline, "unload_lora_weights"):
+        pipeline.unload_lora_weights()
+        logging.info("LoRA adapters fused and unloaded to reduce device memory usage")
+    elif hasattr(pipeline, "delete_adapters") and hasattr(pipeline, "get_active_adapters"):
+        active_adapters = pipeline.get_active_adapters() or []
+        if active_adapters:
+            pipeline.delete_adapters(active_adapters)
+            logging.info("LoRA adapters fused and deleted to reduce device memory usage")
+
+    gc.collect()
+
+
+def _should_decode_on_this_rank(task: str, rank: int, world_size: int) -> bool:
+    if world_size == 1:
+        return True
+    if task not in TEXT_TO_IMAGE_TASKS:
+        return True
+    return rank == 0
 
 
 def _init_logging(rank: int = 0):
@@ -352,16 +401,19 @@ def generate(args: argparse.Namespace):
         vae=vae,
         torch_dtype=torch_dtype
     )
-    # Pipeline移至目标设备
+    if args.lora_path:
+        _load_and_fuse_lora(pipeline, args.lora_path)
+
+    # Move pipeline modules to the target device
     pipeline = pipeline.to(device)
 
-    # 加载LoRA权重
-    if args.lora_path:
-        logging.info(f"开始加载LoRA权重，路径：{args.lora_path}")
-        pipeline.load_lora_weights(pretrained_model_name_or_path_or_dict=args.lora_path)
-        pipeline.fuse_lora(safe_fuse=True)
-        
-    # VAE优化配置（避免显存溢出）
+    decode_on_this_rank = _should_decode_on_this_rank(args.task, rank, world_size)
+    if not decode_on_this_rank and getattr(pipeline, "vae", None) is not None:
+        pipeline.vae.to("cpu")
+        torch.npu.empty_cache()
+        logging.info("VAE decode is restricted to rank 0 for distributed text-to-image inference")
+
+    # Optional VAE memory-saving switches
     if args.vae_tiling:
         pipeline.vae.use_tiling = True
         logging.info("启用VAE分块推理（vae_tiling）")
@@ -400,12 +452,13 @@ def generate(args: argparse.Namespace):
         "guidance_scale": args.guidance_scale,
         "generator": torch.Generator(device="cpu").manual_seed(args.seed),
         "num_images_per_prompt": args.num_images_per_prompt,
-        "num_inference_steps": 3,  # 预热步数，固定3步
+        "num_inference_steps": 3,  # Warm-up steps
         "width": args.width,
         "height": args.height,
+        "output_type": "pil" if decode_on_this_rank else "latent",
     }
 
-    # 编辑/分层任务添加图片参数
+    # Add image inputs for edit and layered tasks
     if "image" in EXAMPLE_PROMPT[args.task]:
         input_images = load_images(args.image, args.color_format)
         inputs_warm_up["image"] = input_images
@@ -441,8 +494,11 @@ def generate(args: argparse.Namespace):
 
     with torch.inference_mode():
         output = pipeline(**inputs)
-    
-     # 设备同步，结束耗时统计
+
+    if dist.is_initialized():
+        dist.barrier()
+
+    # Sync device before finishing the timing window
     torch.npu.synchronize()
     end_time = time.time()
     infer_time = end_time - start_time
