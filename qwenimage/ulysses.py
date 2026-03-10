@@ -312,20 +312,17 @@ class xFuserQwenDoubleStreamAttnProcessor(QwenDoubleStreamAttnProcessor2_0):
             qkv_sycn = True
             async_op = False
      
-        # Compute QKV for image stream (sample projections)
+        # Compute image QKV locally, then pack them on the batch dimension
+        # so the three all-to-all exchanges collapse into a single collective.
+        img_query = attn.to_q(hidden_states).unflatten(-1, (attn.heads, -1))
+        img_key = attn.to_k(hidden_states).unflatten(-1, (attn.heads, -1))
+        img_value = attn.to_v(hidden_states).unflatten(-1, (attn.heads, -1))
+        img_qkv = torch.cat([img_query, img_key, img_value], dim=0)
+
         with _profile_context(stage_profiler, "ulysses_qkv_alltoall"):
-            img_query = attn.to_q(hidden_states).unflatten(-1, (attn.heads, -1))
-            img_query = SeqAllToAll4D.apply(
-                self.ulysses_pg, img_query, self.scatter_idx, self.gather_idx, qkv_sycn
-                # [B, S_image/ulysses_size, H, D] -->   [B, S_image, H/ulysses_size, D]
-            )
-            img_key = attn.to_k(hidden_states).unflatten(-1, (attn.heads, -1))
-            img_key = SeqAllToAll4D.apply(
-                self.ulysses_pg, img_key, self.scatter_idx, self.gather_idx, qkv_sycn
-            )
-            img_value = attn.to_v(hidden_states).unflatten(-1, (attn.heads, -1))
-            img_value = SeqAllToAll4D.apply(
-                self.ulysses_pg, img_value, self.scatter_idx, self.gather_idx, qkv_sycn
+            img_qkv = SeqAllToAll4D.apply(
+                self.ulysses_pg, img_qkv, self.scatter_idx, self.gather_idx, qkv_sycn
+                # [3B, S_image/ulysses_size, H, D] --> [3B, S_image, H/ulysses_size, D]
             )
         # 文本流QKV
         # Compute QKV for text stream (context projections)
@@ -338,8 +335,9 @@ class xFuserQwenDoubleStreamAttnProcessor(QwenDoubleStreamAttnProcessor2_0):
         txt_value = txt_value.unflatten(-1, (attn.heads, -1))
 
         if self.fa_alltoall_overlap == True:
-            img_query = img_query()
-            img_key = img_key()
+            img_qkv = img_qkv()
+
+        img_query, img_key, img_value = torch.chunk(img_qkv, 3, dim=0)
 
         # 第一次 通信完 切除掉 padding
         if img_pad_len > 0:
@@ -382,9 +380,6 @@ class xFuserQwenDoubleStreamAttnProcessor(QwenDoubleStreamAttnProcessor2_0):
                 txt_key, txt_freqs, use_real=False,
                 preprocessed_cos_sin=(txt_cos, txt_sin) if self.rope_fuse else None
             )
-
-        if self.fa_alltoall_overlap == True:
-            img_value = img_value()
 
         # 第一次 通信完 切除掉 padding
         if img_pad_len > 0:
