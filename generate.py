@@ -1,6 +1,7 @@
 import sys
 import os
 import argparse
+import functools
 import time
 import torch
 import torch_npu
@@ -208,6 +209,70 @@ def _should_decode_on_this_rank(task: str, rank: int, world_size: int) -> bool:
     return rank == 0
 
 
+class StageProfiler:
+    def __init__(self):
+        self._wrapped = []
+        self.reset()
+
+    def reset(self):
+        self.stats: Dict[str, Dict[str, float]] = {}
+
+    def _sync_device(self):
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            torch.npu.synchronize()
+
+    def wrap_method(self, obj: Any, method_name: str, stage_name: str):
+        if obj is None or not hasattr(obj, method_name):
+            return
+
+        original = getattr(obj, method_name)
+
+        @functools.wraps(original)
+        def wrapped(*args, **kwargs):
+            self._sync_device()
+            start = time.perf_counter()
+            result = original(*args, **kwargs)
+            self._sync_device()
+
+            stage_stats = self.stats.setdefault(stage_name, {"time": 0.0, "calls": 0})
+            stage_stats["time"] += time.perf_counter() - start
+            stage_stats["calls"] += 1
+            return result
+
+        setattr(obj, method_name, wrapped)
+        self._wrapped.append((obj, method_name, original))
+
+    def uninstall(self):
+        for obj, method_name, original in reversed(self._wrapped):
+            setattr(obj, method_name, original)
+        self._wrapped.clear()
+
+    def log(self, total_time: float, rank: int):
+        if rank != 0:
+            return
+
+        accounted = 0.0
+        ordered_stages = [
+            "encode_prompt",
+            "transformer_forward",
+            "vae_decode",
+            "postprocess",
+        ]
+
+        logging.info("Stage profiling for the timed inference run:")
+        for stage_name in ordered_stages:
+            if stage_name not in self.stats:
+                continue
+            stage_stats = self.stats[stage_name]
+            accounted += stage_stats["time"]
+            logging.info(
+                f"  {stage_name}: {stage_stats['time']:.4f}s across {int(stage_stats['calls'])} call(s)"
+            )
+
+        other_time = max(total_time - accounted, 0.0)
+        logging.info(f"  other: {other_time:.4f}s")
+
+
 def _init_logging(rank: int = 0):
     """
     分级日志初始化，主进程打印INFO，子进程仅打印ERROR，避免分布式日志刷屏
@@ -307,6 +372,7 @@ def _parse_args() -> argparse.Namespace:
 
     # 扩展配置
     parser.add_argument("--lora_path", type=str, default=None, help="LoRA权重路径（仅Edit-2509/2511任务有效）")
+    parser.add_argument("--profile_stages", action="store_true", default=False, help="统计单次正式推理中各阶段的耗时")
 
     args = parser.parse_args()
     rank = int(os.getenv("RANK", 0))  # 获取rank（分布式/单卡）
@@ -446,6 +512,15 @@ def generate(args: argparse.Namespace):
     if args.ulysses_size > 1:
         parallelize_qwen_image_transformer(pipeline)
 
+    profiler = None
+    if args.profile_stages:
+        profiler = StageProfiler()
+        profiler.wrap_method(pipeline, "encode_prompt", "encode_prompt")
+        profiler.wrap_method(pipeline.transformer, "forward", "transformer_forward")
+        profiler.wrap_method(getattr(pipeline, "vae", None), "decode", "vae_decode")
+        profiler.wrap_method(getattr(pipeline, "image_processor", None), "postprocess", "postprocess")
+        logging.info("Stage profiling is enabled for the timed inference run")
+
     # 构造推理输入参数（分预热和正式，预热3步解决首次算子编译耗时
     inputs_warm_up: Dict[str, Any] = {
         "prompt": args.prompt,
@@ -497,6 +572,8 @@ def generate(args: argparse.Namespace):
 
     # 正式推理（统计端到端耗时）
     # 设备同步，保证耗时统计准确
+    if profiler is not None:
+        profiler.reset()
     torch.npu.synchronize()
     start_time = time.time()
 
@@ -508,6 +585,8 @@ def generate(args: argparse.Namespace):
     end_time = time.time()
     infer_time = end_time - start_time
     logging.info(f"正式推理完成，端到端耗时：{infer_time:.4f}秒")
+    if profiler is not None:
+        profiler.log(infer_time, rank)
 
     # 仅主进程（rank=0）保存图片，避免分布式多进程重复写入/覆盖
     if rank == 0:
@@ -552,6 +631,9 @@ def generate(args: argparse.Namespace):
     # 清空设备缓存
     torch.npu.empty_cache()
     logging.info("资源释放完成")
+
+    if profiler is not None:
+        profiler.uninstall()
 
    # 销毁分布式进程组（仅分布式场景）
     if world_size > 1:
