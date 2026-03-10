@@ -485,6 +485,12 @@ def generate(args: argparse.Namespace):
     with torch.inference_mode():
         output_warm = pipeline(**inputs_warm_up)
 
+    # Warm-up output is not used later. Release it before the timed run to
+    # avoid keeping extra tensors alive across the distributed synchronization.
+    del output_warm
+    gc.collect()
+    torch.npu.empty_cache()
+
     # 分布式屏障，等待所有进程预热完成
     if dist.is_initialized():
         dist.barrier()
@@ -496,9 +502,6 @@ def generate(args: argparse.Namespace):
 
     with torch.inference_mode():
         output = pipeline(**inputs)
-
-    if dist.is_initialized():
-        dist.barrier()
 
     # Sync device before finishing the timing window
     torch.npu.synchronize()
@@ -541,7 +544,7 @@ def generate(args: argparse.Namespace):
     # 资源释放（关键：避免显存泄漏/碎片，尤其多次推理时）
     logging.info("开始释放推理资源，清理显存/内存")
     # 删除大变量，释放内存
-    del output, output_warm, pipeline, transformer
+    del output, pipeline, transformer
     if vae is not None:
         del vae
     # 强制垃圾回收
