@@ -1,6 +1,7 @@
 import sys
 import os
 import argparse
+from contextlib import contextmanager
 import functools
 import time
 import torch
@@ -242,6 +243,20 @@ class StageProfiler:
         setattr(obj, method_name, wrapped)
         self._wrapped.append((obj, method_name, original))
 
+    @contextmanager
+    def record(self, stage_name: str, sync: bool = True):
+        if sync:
+            self._sync_device()
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            if sync:
+                self._sync_device()
+            stage_stats = self.stats.setdefault(stage_name, {"time": 0.0, "calls": 0})
+            stage_stats["time"] += time.perf_counter() - start
+            stage_stats["calls"] += 1
+
     def uninstall(self):
         for obj, method_name, original in reversed(self._wrapped):
             setattr(obj, method_name, original)
@@ -252,19 +267,35 @@ class StageProfiler:
             return
 
         accounted = 0.0
-        ordered_stages = [
+        primary_stages = [
             "encode_prompt",
             "transformer_forward",
             "vae_decode",
             "postprocess",
         ]
+        detailed_stages = [
+            "ulysses_qkv_alltoall",
+            "ulysses_attention_kernel",
+            "ulysses_img_out_alltoall",
+            "ulysses_txt_allgather",
+            "ulysses_output_projection",
+            "ulysses_transformer_output_allgather",
+        ]
 
         logging.info("Stage profiling for the timed inference run:")
-        for stage_name in ordered_stages:
+        for stage_name in primary_stages:
             if stage_name not in self.stats:
                 continue
             stage_stats = self.stats[stage_name]
             accounted += stage_stats["time"]
+            logging.info(
+                f"  {stage_name}: {stage_stats['time']:.4f}s across {int(stage_stats['calls'])} call(s)"
+            )
+
+        for stage_name in detailed_stages:
+            if stage_name not in self.stats:
+                continue
+            stage_stats = self.stats[stage_name]
             logging.info(
                 f"  {stage_name}: {stage_stats['time']:.4f}s across {int(stage_stats['calls'])} call(s)"
             )
@@ -519,6 +550,11 @@ def generate(args: argparse.Namespace):
         profiler.wrap_method(pipeline.transformer, "forward", "transformer_forward")
         profiler.wrap_method(getattr(pipeline, "vae", None), "decode", "vae_decode")
         profiler.wrap_method(getattr(pipeline, "image_processor", None), "postprocess", "postprocess")
+        if args.ulysses_size > 1:
+            for block in pipeline.transformer.transformer_blocks:
+                if hasattr(block.attn, "processor"):
+                    block.attn.processor._stage_profiler = profiler
+            pipeline.transformer._stage_profiler = profiler
         logging.info("Stage profiling is enabled for the timed inference run")
 
     # 构造推理输入参数（分预热和正式，预热3步解决首次算子编译耗时

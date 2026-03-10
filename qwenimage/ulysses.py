@@ -3,6 +3,7 @@ import torch_npu
 import numpy as np
 import functools
 import os
+from contextlib import nullcontext
 from math import prod
 from typing import Optional, Tuple, Union, List, Dict, Any
 
@@ -31,6 +32,12 @@ from .distributed.parallel_mgr import (
 
 from .distributed.all_to_all import SeqAllToAll4D
 
+
+def _profile_context(profiler, stage_name: str):
+    if profiler is None:
+        return nullcontext()
+    return profiler.record(stage_name)
+
 # Transformer并行化函数（适配Qwen-Image结构）
 def parallelize_qwen_image_transformer(pipe: DiffusionPipeline):
     """
@@ -56,6 +63,7 @@ def parallelize_qwen_image_transformer(pipe: DiffusionPipeline):
         use_cache: bool = False,     
         if_cond: bool = True,    
     ) -> Union[Tuple[torch.Tensor], Transformer2DModelOutput]:
+        stage_profiler = getattr(self, "_stage_profiler", None)
         if txt_seq_lens is not None:
             deprecate(
                 "txt_seq_lens",
@@ -218,7 +226,11 @@ def parallelize_qwen_image_transformer(pipe: DiffusionPipeline):
                     (0, 0, 0, img_pad_len, 0, 0)  # (左,右,上,下,前,后)，仅填充seq_len维度（dim=1）
                 )
 
-        output = output if sp_world_size <= 1 else get_sp_group().all_gather(output, dim=1)
+        if sp_world_size <= 1:
+            output = output
+        else:
+            with _profile_context(stage_profiler, "ulysses_transformer_output_allgather"):
+                output = get_sp_group().all_gather(output, dim=1)
 
         # 第一次 通信完 切除掉 padding
         if img_pad_len > 0:
@@ -275,6 +287,7 @@ class xFuserQwenDoubleStreamAttnProcessor(QwenDoubleStreamAttnProcessor2_0):
         img_pad_len = None,
         # txt_pad_len = None
     ) -> torch.FloatTensor:
+        stage_profiler = getattr(self, "_stage_profiler", None)
         if encoder_hidden_states is None:
             raise ValueError("QwenDoubleStreamAttnProcessor2_0 requires encoder_hidden_states (text stream)")
 
@@ -300,19 +313,20 @@ class xFuserQwenDoubleStreamAttnProcessor(QwenDoubleStreamAttnProcessor2_0):
             async_op = False
      
         # Compute QKV for image stream (sample projections)
-        img_query = attn.to_q(hidden_states).unflatten(-1, (attn.heads, -1))
-        img_query = SeqAllToAll4D.apply(
-            self.ulysses_pg, img_query, self.scatter_idx, self.gather_idx, qkv_sycn
-            # [B, S_image/ulysses_size, H, D] -->   [B, S_image, H/ulysses_size, D]
-        )
-        img_key = attn.to_k(hidden_states).unflatten(-1, (attn.heads, -1))
-        img_key = SeqAllToAll4D.apply(
-            self.ulysses_pg, img_key, self.scatter_idx, self.gather_idx, qkv_sycn
-        )
-        img_value = attn.to_v(hidden_states).unflatten(-1, (attn.heads, -1))
-        img_value = SeqAllToAll4D.apply(
-            self.ulysses_pg, img_value, self.scatter_idx, self.gather_idx, qkv_sycn
-        )
+        with _profile_context(stage_profiler, "ulysses_qkv_alltoall"):
+            img_query = attn.to_q(hidden_states).unflatten(-1, (attn.heads, -1))
+            img_query = SeqAllToAll4D.apply(
+                self.ulysses_pg, img_query, self.scatter_idx, self.gather_idx, qkv_sycn
+                # [B, S_image/ulysses_size, H, D] -->   [B, S_image, H/ulysses_size, D]
+            )
+            img_key = attn.to_k(hidden_states).unflatten(-1, (attn.heads, -1))
+            img_key = SeqAllToAll4D.apply(
+                self.ulysses_pg, img_key, self.scatter_idx, self.gather_idx, qkv_sycn
+            )
+            img_value = attn.to_v(hidden_states).unflatten(-1, (attn.heads, -1))
+            img_value = SeqAllToAll4D.apply(
+                self.ulysses_pg, img_value, self.scatter_idx, self.gather_idx, qkv_sycn
+            )
         # 文本流QKV
         # Compute QKV for text stream (context projections)
         txt_query = attn.add_q_proj(encoder_hidden_states)
@@ -383,35 +397,36 @@ class xFuserQwenDoubleStreamAttnProcessor(QwenDoubleStreamAttnProcessor2_0):
         joint_query = torch.cat([txt_query, img_query], dim=1)  # (B, S_txt  + S_img, H/ulysses_size, D_head)
         joint_key = torch.cat([txt_key, img_key], dim=1)
         joint_value = torch.cat([txt_value, img_value], dim=1)
-        if self.algo == 0:
-            out = dispatch_attention_fn(
-                joint_query,
-                joint_key,
-                joint_value,
-                attn_mask=attention_mask,
-                dropout_p=0.0,
-                is_causal=False,
-                backend=self._attention_backend,
-                parallel_config=self._parallel_config,
-            )
-        elif self.algo == 1:
-            out = attention_forward(
-                joint_query, 
-                joint_key, 
-                joint_value,
-                opt_mode="manual", 
-                op_type="fused_attn_score", 
-                layout="BSND"
-            )
-        elif self.algo == 3:
-            joint_query = joint_query * self.scale
-            out = attention_forward(
-                joint_query, 
-                joint_key, 
-                joint_value,
-                opt_mode="manual",
-                op_type="ascend_laser_attention", 
-                layout="BNSD")
+        with _profile_context(stage_profiler, "ulysses_attention_kernel"):
+            if self.algo == 0:
+                out = dispatch_attention_fn(
+                    joint_query,
+                    joint_key,
+                    joint_value,
+                    attn_mask=attention_mask,
+                    dropout_p=0.0,
+                    is_causal=False,
+                    backend=self._attention_backend,
+                    parallel_config=self._parallel_config,
+                )
+            elif self.algo == 1:
+                out = attention_forward(
+                    joint_query, 
+                    joint_key, 
+                    joint_value,
+                    opt_mode="manual", 
+                    op_type="fused_attn_score", 
+                    layout="BSND"
+                )
+            elif self.algo == 3:
+                joint_query = joint_query * self.scale
+                out = attention_forward(
+                    joint_query, 
+                    joint_key, 
+                    joint_value,
+                    opt_mode="manual",
+                    op_type="ascend_laser_attention", 
+                    layout="BNSD")
 
         if type(out) == tuple:
             context_layer, _, _ = out
@@ -430,10 +445,11 @@ class xFuserQwenDoubleStreamAttnProcessor(QwenDoubleStreamAttnProcessor2_0):
                 (0, 0, 0, 0, 0, img_pad_len, 0, 0)  # (左,右,上,下,前,后)，仅填充seq_len维度（dim=1）
             )
 
-        img_attn_output = SeqAllToAll4D.apply(
-            self.ulysses_pg, image_out, self.gather_idx, self.scatter_idx, True
-            # [B,  S_image, H/ulysses_size, D] -->  [B, S_image/ulysses_size, H, D]
-        ).flatten(2, 3).to(img_query.dtype)
+        with _profile_context(stage_profiler, "ulysses_img_out_alltoall"):
+            img_attn_output = SeqAllToAll4D.apply(
+                self.ulysses_pg, image_out, self.gather_idx, self.scatter_idx, True
+                # [B,  S_image, H/ulysses_size, D] -->  [B, S_image/ulysses_size, H, D]
+            ).flatten(2, 3).to(img_query.dtype)
 
         # 第二次 通信后 切除掉 padding
         if img_pad_len > 0:
@@ -441,15 +457,17 @@ class xFuserQwenDoubleStreamAttnProcessor(QwenDoubleStreamAttnProcessor2_0):
                 img_attn_output_len = img_attn_output.shape[1]
                 img_attn_output = img_attn_output[:, :img_attn_output_len-img_pad_len, :].contiguous()
 
-        txt_attn_output = get_sp_group().all_gather(text_out, dim=2, async_op=async_op)  # (B, S_txt  , H/ulysses_size, D_head)  -->  (B, S_txt  , H, D_head)
+        with _profile_context(stage_profiler, "ulysses_txt_allgather"):
+            txt_attn_output = get_sp_group().all_gather(text_out, dim=2, async_op=async_op)  # (B, S_txt  , H/ulysses_size, D_head)  -->  (B, S_txt  , H, D_head)
 
         # 输出投影
-        img_attn_output = attn.to_out[0](img_attn_output)
-        if len(attn.to_out) > 1:
-            img_attn_output = attn.to_out[1](img_attn_output)
-        if self.fa_alltoall_overlap == True:
-            txt_attn_output = txt_attn_output()
-        txt_attn_output = txt_attn_output.flatten(2, 3).to(img_query.dtype)
-        txt_attn_output = attn.to_add_out(txt_attn_output)
+        with _profile_context(stage_profiler, "ulysses_output_projection"):
+            img_attn_output = attn.to_out[0](img_attn_output)
+            if len(attn.to_out) > 1:
+                img_attn_output = attn.to_out[1](img_attn_output)
+            if self.fa_alltoall_overlap == True:
+                txt_attn_output = txt_attn_output()
+            txt_attn_output = txt_attn_output.flatten(2, 3).to(img_query.dtype)
+            txt_attn_output = attn.to_add_out(txt_attn_output)
       
         return img_attn_output, txt_attn_output
