@@ -18,7 +18,7 @@ MASTER_PORT=29508
 export ASCEND_RT_VISIBLE_DEVICES=${DEVICE_IDS}
 
 # ====================== 执行推理 ======================
-# 2卡并行(cfg_size=2 ulysses_size=1 优于 cfg_size=1 ulysses_size=2 )
+# 2卡并行（当前脚本对应“无negative_prompt”场景，因此只使用Ulysses并行）
 torchrun --nproc_per_node=${NPROC_PER_NODE} --master-port ${MASTER_PORT} generate.py \
     --task ${TASK} \
     --ckpt_dir ${MODEL_PATH} \
@@ -30,5 +30,5 @@ torchrun --nproc_per_node=${NPROC_PER_NODE} --master-port ${MASTER_PORT} generat
     --seed 42 \
     --output_file "./output/image_edit_2511_.png" \
     --lora_path /root/work/filestorage/cyy/Qwen-Image-Edit-2511-Lightning/lora \
-    --cfg_size 2 \
-    --ulysses_size 1
+    --cfg_size 1 \
+    --ulysses_size 2

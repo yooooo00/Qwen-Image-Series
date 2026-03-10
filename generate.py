@@ -235,6 +235,8 @@ def _validate_args(args: argparse.Namespace):
     if args.image is None and "image" in EXAMPLE_PROMPT[args.task]:
         args.image = EXAMPLE_PROMPT[args.task]["image"]
         logging.info(f"未指定--image，使用{args.task}默认示例图片：{args.image}")
+    if args.cfg_size == 2 and args.negative_prompt is None:
+        raise ValueError("cfg_size=2 requires an explicit --negative_prompt (use a blank string like \" \" if you want unconditional CFG)")
 
     # 数值参数范围校验
     assert args.cfg_scale > 0, f"CFG系数必须大于0，当前值：{args.cfg_scale}"
