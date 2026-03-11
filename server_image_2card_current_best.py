@@ -53,6 +53,7 @@ class QwenImageService:
         self.rank = int(os.getenv("RANK", 0))
         self.world_size = int(os.getenv("WORLD_SIZE", 1))
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
+        self.command_lock = threading.Lock()
         _init_logging(self.rank)
 
         self._validate_args()
@@ -270,11 +271,17 @@ class QwenImageService:
             "infer_time": infer_time,
         }
 
-    def broadcast_command(self, cmd: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    def broadcast_command_locked(self, cmd: str, payload: Optional[Dict[str, Any]] = None) -> None:
         if self.world_size <= 1:
             return
         obj = [{"cmd": cmd, "payload": payload}]
         dist.broadcast_object_list(obj, src=0)
+
+    def broadcast_command(self, cmd: str, payload: Optional[Dict[str, Any]] = None) -> None:
+        if self.world_size <= 1:
+            return
+        with self.command_lock:
+            self.broadcast_command_locked(cmd, payload)
 
     def recv_command(self) -> Dict[str, Any]:
         if self.world_size <= 1:
@@ -287,6 +294,35 @@ class QwenImageService:
         if dist.is_initialized():
             dist.destroy_process_group()
             logging.info("Destroyed distributed process group")
+
+
+class Rank0Heartbeat:
+    def __init__(self, service: QwenImageService, interval_s: int):
+        self.service = service
+        self.interval_s = interval_s
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="rank0-heartbeat", daemon=True)
+
+    def start(self) -> None:
+        if self.service.rank == 0 and self.service.world_size > 1 and self.interval_s > 0:
+            logging.info(f"Heartbeat enabled, interval={self.interval_s}s")
+            self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread.is_alive():
+            self.thread.join(timeout=self.interval_s + 2)
+
+    def _run(self) -> None:
+        while not self.stop_event.wait(self.interval_s):
+            try:
+                with self.service.command_lock:
+                    self.service.broadcast_command_locked("idle", None)
+            except Exception as exc:
+                if self.stop_event.is_set():
+                    return
+                logging.error(f"Heartbeat broadcast failed: {exc}", exc_info=True)
+                return
 
 
 @app.route("/health", methods=["GET", "POST"])
@@ -321,10 +357,12 @@ def infer():
     try:
         payload = SERVICE._normalize_payload(request.get_json(force=True, silent=False) or {})
 
-        if SERVICE.world_size > 1:
-            SERVICE.broadcast_command("infer", payload)
-
-        result = SERVICE.infer_once(payload)
+        # Keep command broadcasts serialized. Hold the same lock through the
+        # whole distributed inference window to prevent heartbeat/interference.
+        with SERVICE.command_lock:
+            if SERVICE.world_size > 1:
+                SERVICE.broadcast_command_locked("infer", payload)
+            result = SERVICE.infer_once(payload)
         response["code"] = 201
         response["result"] = result["image_b64"]
         response["message"] = "success"
@@ -389,6 +427,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--cfg_size", type=int, default=1, choices=[1, 2])
     parser.add_argument("--ulysses_size", type=int, default=2)
     parser.add_argument("--device_id", type=int, default=0)
+    parser.add_argument("--heartbeat_interval_s", type=int, default=30)
 
     return parser.parse_args()
 
@@ -396,6 +435,10 @@ def _parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = _parse_args()
     SERVICE = QwenImageService(args)
+    heartbeat = None
+    if SERVICE.rank == 0 and SERVICE.world_size > 1:
+        heartbeat = Rank0Heartbeat(SERVICE, args.heartbeat_interval_s)
+        heartbeat.start()
 
     try:
         if SERVICE.rank == 0:
@@ -403,9 +446,12 @@ if __name__ == "__main__":
         else:
             _worker_loop(SERVICE)
     finally:
+        if heartbeat is not None:
+            heartbeat.stop()
         if SERVICE is not None and SERVICE.rank == 0 and SERVICE.world_size > 1 and dist.is_initialized():
             try:
-                SERVICE.broadcast_command("stop", None)
+                with SERVICE.command_lock:
+                    SERVICE.broadcast_command_locked("stop", None)
             except Exception:
                 pass
         if SERVICE is not None:
