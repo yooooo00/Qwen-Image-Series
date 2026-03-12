@@ -250,7 +250,7 @@ def infer():
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Qwen-Image 1-card service (best current settings)")
     parser.add_argument("--host", type=str, default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=26004)
+    parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--task", type=str, default="Qwen-Image", choices=["Qwen-Image", "Qwen-Image-2512"])
     parser.add_argument("--ckpt_dir", type=str, default="/root/work/filestorage/cyy/Qwen-Image")
     parser.add_argument("--lora_path", type=str, default="/root/work/filestorage/cyy/Qwen-Image-Lightning/lora")

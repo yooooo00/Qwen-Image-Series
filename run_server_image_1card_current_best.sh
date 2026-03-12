@@ -21,7 +21,7 @@ LORA_PATH="/root/work/filestorage/cyy/Qwen-Image-Lightning/lora"
 
 DEVICE_IDS="0"
 SERVICE_HOST="0.0.0.0"
-SERVICE_PORT=26004
+SERVICE_PORT=8000
 
 export ASCEND_RT_VISIBLE_DEVICES=${DEVICE_IDS}
 
