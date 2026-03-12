@@ -58,7 +58,7 @@ def main() -> None:
     parser.add_argument(
         "--api_url",
         type=str,
-        default="http://127.0.0.1:26004/qwenimage",
+        default="http://127.0.0.1:8000/qwenimage",
         help="Qwen image API endpoint",
     )
     parser.add_argument(
