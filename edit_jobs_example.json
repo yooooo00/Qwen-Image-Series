@@ -1,0 +1,9 @@
+[
+  {
+    "prompt": "Make Pikachu hold a sign that says 'Qwen Edit is awesome', yarn art style, detailed, vibrant color",
+    "image_path": "examples/yarn-art-pikachu.png",
+    "width": 1024,
+    "height": 1024,
+    "steps": 8
+  }
+]
