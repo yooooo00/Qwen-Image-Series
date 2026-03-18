@@ -1071,6 +1071,19 @@ class QwenImageTransformer2DModel(
         self.cache_uncond = None
         #-------------------------------
 
+    def clear_rope_cache(self) -> None:
+        # The attention processors cache preprocessed RoPE tensors by tensor
+        # shape. Different aspect ratios can share the same sequence length,
+        # so this cache must not survive across requests.
+        for blocks_name in ("transformer_blocks", "single_transformer_blocks"):
+            blocks = getattr(self, blocks_name, None)
+            if blocks is None:
+                continue
+            for block in blocks:
+                processor = getattr(getattr(block, "attn", None), "processor", None)
+                if hasattr(processor, "_rope_cos_sin_cache"):
+                    processor._rope_cos_sin_cache.clear()
+
     def forward(
         self,
         hidden_states: torch.Tensor,

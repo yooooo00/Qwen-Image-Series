@@ -697,6 +697,8 @@ class QwenImageEditPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
         self._attention_kwargs = attention_kwargs
         self._current_timestep = None
         self._interrupt = False
+        if hasattr(self.transformer, "clear_rope_cache"):
+            self.transformer.clear_rope_cache()
 
         # 2. Define call parameters
         if prompt is not None and isinstance(prompt, str):

@@ -685,6 +685,8 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         self._attention_kwargs = attention_kwargs
         self._current_timestep = None
         self._interrupt = False
+        if hasattr(self.transformer, "clear_rope_cache"):
+            self.transformer.clear_rope_cache()
 
         device = self._execution_device
         # 2. Preprocess image
