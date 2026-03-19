@@ -39,7 +39,6 @@ torchrun --nproc_per_node=${NPROC_PER_NODE} --master-port ${MASTER_PORT} server_
     --num_inference_steps 8 \
     --width 1024 \
     --height 1024 \
-    --max_infer_width 1024 \
-    --max_infer_height 1024 \
+    --max_infer_area 1048576 \
     --cfg_size 1 \
     --ulysses_size 2

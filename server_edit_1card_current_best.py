@@ -77,21 +77,46 @@ def _close_payload_images(payload: Optional[Dict[str, Any]]) -> None:
 def _resolve_infer_size(
     width: int,
     height: int,
+    max_infer_area: int,
     max_infer_width: int,
     max_infer_height: int,
     multiple: int = 16,
 ) -> tuple[int, int, bool]:
     infer_width = max((width // multiple) * multiple, multiple)
     infer_height = max((height // multiple) * multiple, multiple)
+    size_limited = False
+
+    max_blocks = max_infer_area // (multiple * multiple) if max_infer_area > 0 else 0
+    block_width = infer_width // multiple
+    block_height = infer_height // multiple
+
+    if max_blocks > 0 and block_width * block_height > max_blocks:
+        target_ratio = width / height
+        while block_width * block_height > max_blocks:
+            reduce_width_error = math.inf
+            reduce_height_error = math.inf
+            if block_width > 1:
+                reduce_width_error = abs(((block_width - 1) / block_height) - target_ratio)
+            if block_height > 1:
+                reduce_height_error = abs((block_width / (block_height - 1)) - target_ratio)
+
+            if reduce_width_error <= reduce_height_error:
+                block_width -= 1
+            else:
+                block_height -= 1
+
+        infer_width = block_width * multiple
+        infer_height = block_height * multiple
+        size_limited = True
 
     if max_infer_width <= 0 and max_infer_height <= 0:
-        return infer_width, infer_height, False
+        return infer_width, infer_height, size_limited
 
     max_width = max_infer_width if max_infer_width > 0 else infer_width
     max_height = max_infer_height if max_infer_height > 0 else infer_height
 
     if infer_width <= max_width and infer_height <= max_height:
-        return infer_width, infer_height, False
+        return infer_width, infer_height, size_limited
 
     scale = min(max_width / width, max_height / height)
     scaled_width = max(int(math.floor(width * scale)), multiple)
@@ -148,6 +173,10 @@ class QwenEditSingleCardService:
             raise FileNotFoundError(f"Checkpoint path not found: {self.args.ckpt_dir}")
         if self.args.lora_path and not os.path.exists(self.args.lora_path):
             raise FileNotFoundError(f"LoRA path not found: {self.args.lora_path}")
+        if self.args.max_infer_area is not None and self.args.max_infer_area < 0:
+            raise ValueError("max_infer_area must be >= 0")
+        if self.args.max_infer_area not in (None, 0) and self.args.max_infer_area < 16 * 16:
+            raise ValueError("max_infer_area must be 0 or >= 256")
         for name in ("max_infer_width", "max_infer_height"):
             value = getattr(self.args, name)
             if value is not None and value < 0:
@@ -244,6 +273,7 @@ class QwenEditSingleCardService:
         infer_width, infer_height, size_limited = _resolve_infer_size(
             width,
             height,
+            self.args.max_infer_area,
             self.args.max_infer_width,
             self.args.max_infer_height,
         )
@@ -252,7 +282,8 @@ class QwenEditSingleCardService:
         if size_limited:
             logging.info(
                 f"Request size limited from {width}x{height} to {infer_width}x{infer_height} "
-                f"(max_infer_width={self.args.max_infer_width}, max_infer_height={self.args.max_infer_height})"
+                f"(max_infer_area={self.args.max_infer_area}, "
+                f"max_infer_width={self.args.max_infer_width}, max_infer_height={self.args.max_infer_height})"
             )
 
         return {
@@ -438,6 +469,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num_inference_steps", type=int, default=8)
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--height", type=int, default=1024)
+    parser.add_argument("--max_infer_area", type=int, default=0)
     parser.add_argument("--max_infer_width", type=int, default=0)
     parser.add_argument("--max_infer_height", type=int, default=0)
     parser.add_argument("--cfg_scale", type=float, default=4.0)
