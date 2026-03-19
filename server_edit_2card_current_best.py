@@ -63,6 +63,25 @@ def _load_image_entry(entry: str, color_format: str = "RGB") -> Image.Image:
     return _decode_base64_image(entry, color_format=color_format)
 
 
+def _is_oom_error(exc: BaseException) -> bool:
+    return "out of memory" in str(exc).lower()
+
+
+def _close_payload_images(payload: Optional[Dict[str, Any]]) -> None:
+    if not payload:
+        return
+    images = payload.get("images")
+    if not isinstance(images, list):
+        return
+    for image in images:
+        if isinstance(image, Image.Image):
+            try:
+                image.close()
+            except Exception:
+                pass
+    payload["images"] = []
+
+
 def _parse_image_entries(raw: Dict[str, Any]) -> List[str]:
     if "images" in raw:
         images = raw["images"]
@@ -311,25 +330,43 @@ class QwenEditService:
 
     def infer_once(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         inputs = self._build_infer_inputs(payload)
+        output = None
+        image = None
 
-        torch.npu.synchronize()
-        start = time.time()
-        with torch.inference_mode():
-            output = self.pipeline(**inputs)
-        torch.npu.synchronize()
-        infer_time = time.time() - start
+        try:
+            torch.npu.synchronize()
+            start = time.time()
+            with torch.inference_mode():
+                output = self.pipeline(**inputs)
+            torch.npu.synchronize()
+            infer_time = time.time() - start
 
-        result_image_b64: Optional[str] = None
-        if self.rank == 0:
-            image = output.images[0]
-            target_size = (payload["target_width"], payload["target_height"])
-            if image.size != target_size:
-                image = image.resize(target_size)
-            result_image_b64 = _pil_to_base64_png(image)
+            result_image_b64: Optional[str] = None
+            if self.rank == 0:
+                image = output.images[0]
+                target_size = (payload["target_width"], payload["target_height"])
+                if image.size != target_size:
+                    image = image.resize(target_size)
+                result_image_b64 = _pil_to_base64_png(image)
 
-        del output
-        gc.collect()
-        return {"image_b64": result_image_b64, "infer_time": infer_time}
+            return {"image_b64": result_image_b64, "infer_time": infer_time}
+        except Exception as exc:
+            if _is_oom_error(exc):
+                logging.warning("OOM during edit inference, clearing request memory before re-raising")
+            raise
+        finally:
+            if image is not None:
+                del image
+            if output is not None:
+                del output
+            del inputs
+            _close_payload_images(payload)
+            gc.collect()
+            try:
+                torch.npu.synchronize()
+            except Exception:
+                pass
+            torch.npu.empty_cache()
 
     def broadcast_command_locked(self, cmd: str, payload: Optional[Dict[str, Any]] = None) -> None:
         if self.world_size <= 1:
@@ -387,6 +424,7 @@ def health():
 def _handle_infer_request():
     global SERVICE
     response = {"code": 20090, "result": None, "message": "", "performance": {}}
+    payload = None
 
     if SERVICE is None:
         response["code"] = 500
@@ -421,6 +459,10 @@ def _handle_infer_request():
         return json.dumps(response, ensure_ascii=False), 200, {"content-type": "application/json"}
     except Exception as exc:
         logging.error(f"Inference failed: {exc}", exc_info=True)
+        if _is_oom_error(exc) and SERVICE is not None:
+            _close_payload_images(payload)
+            gc.collect()
+            torch.npu.empty_cache()
         response["code"] = 402
         response["message"] = "failed"
         return json.dumps(response, ensure_ascii=False), 200, {"content-type": "application/json"}
@@ -453,6 +495,10 @@ def _worker_loop(service: QwenEditService) -> None:
         try:
             service.infer_once(payload)
         except Exception as exc:
+            if _is_oom_error(exc):
+                _close_payload_images(payload)
+                gc.collect()
+                torch.npu.empty_cache()
             logging.error(f"Worker inference failed: {exc}", exc_info=True)
 
 
