@@ -1,6 +1,5 @@
 # Qwen-Image-Series
 
-本 README 只保留实际使用所需内容，不包含环境准备步骤（使用 九天-开发平台-昇腾协作调试 内qwen-image-series-2镜像环境）。
 
 ## 权重链接
 ### Base 模型
