@@ -4,6 +4,7 @@ import gc
 import io
 import json
 import logging
+import math
 import os
 import random
 import threading
@@ -82,6 +83,37 @@ def _close_payload_images(payload: Optional[Dict[str, Any]]) -> None:
     payload["images"] = []
 
 
+def _resolve_infer_size(
+    width: int,
+    height: int,
+    max_infer_width: int,
+    max_infer_height: int,
+    multiple: int = 16,
+) -> tuple[int, int, bool]:
+    infer_width = max((width // multiple) * multiple, multiple)
+    infer_height = max((height // multiple) * multiple, multiple)
+
+    if max_infer_width <= 0 and max_infer_height <= 0:
+        return infer_width, infer_height, False
+
+    max_width = max_infer_width if max_infer_width > 0 else infer_width
+    max_height = max_infer_height if max_infer_height > 0 else infer_height
+
+    if infer_width <= max_width and infer_height <= max_height:
+        return infer_width, infer_height, False
+
+    scale = min(max_width / width, max_height / height)
+    scaled_width = max(int(math.floor(width * scale)), multiple)
+    scaled_height = max(int(math.floor(height * scale)), multiple)
+    infer_width = max((scaled_width // multiple) * multiple, multiple)
+    infer_height = max((scaled_height // multiple) * multiple, multiple)
+    infer_width = min(infer_width, max_width)
+    infer_height = min(infer_height, max_height)
+    infer_width = max((infer_width // multiple) * multiple, multiple)
+    infer_height = max((infer_height // multiple) * multiple, multiple)
+    return infer_width, infer_height, True
+
+
 def _parse_image_entries(raw: Dict[str, Any]) -> List[str]:
     if "images" in raw:
         images = raw["images"]
@@ -141,6 +173,12 @@ class QwenEditService:
                 f"Got cfg_size={self.args.cfg_size}, ulysses_size={self.args.ulysses_size}, "
                 f"WORLD_SIZE={self.world_size}"
             )
+        for name in ("max_infer_width", "max_infer_height"):
+            value = getattr(self.args, name)
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must be >= 0")
+            if value not in (None, 0) and value < 16:
+                raise ValueError(f"{name} must be 0 or >= 16")
 
     def _init_device(self) -> torch.device:
         device_idx = self.local_rank if self.world_size > 1 else self.args.device_id
@@ -253,10 +291,19 @@ class QwenEditService:
         if cfg_scale <= 0 or guidance_scale <= 0:
             raise ValueError("cfg_scale and guidance_scale must be > 0")
 
-        infer_width = max((width // 16) * 16, 16)
-        infer_height = max((height // 16) * 16, 16)
+        infer_width, infer_height, size_limited = _resolve_infer_size(
+            width,
+            height,
+            self.args.max_infer_width,
+            self.args.max_infer_height,
+        )
         image_entries = _parse_image_entries(raw)
         images = self._load_images_from_entries(image_entries)
+        if size_limited and self.rank == 0:
+            logging.info(
+                f"Request size limited from {width}x{height} to {infer_width}x{infer_height} "
+                f"(max_infer_width={self.args.max_infer_width}, max_infer_height={self.args.max_infer_height})"
+            )
 
         return {
             "prompt": str(raw["prompt"]),
@@ -269,6 +316,7 @@ class QwenEditService:
             "infer_height": infer_height,
             "target_width": width,
             "target_height": height,
+            "size_limited": size_limited,
             "images": images,
         }
 
@@ -454,6 +502,7 @@ def _handle_infer_request():
             "infer_height": payload["infer_height"],
             "target_width": payload["target_width"],
             "target_height": payload["target_height"],
+            "size_limited": payload["size_limited"],
             "num_input_images": len(payload["images"]),
         }
         return json.dumps(response, ensure_ascii=False), 200, {"content-type": "application/json"}
@@ -520,6 +569,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num_inference_steps", type=int, default=8)
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--height", type=int, default=1024)
+    parser.add_argument("--max_infer_width", type=int, default=0)
+    parser.add_argument("--max_infer_height", type=int, default=0)
     parser.add_argument("--cfg_scale", type=float, default=4.0)
     parser.add_argument("--guidance_scale", type=float, default=1.0)
     parser.add_argument("--negative_prompt", type=str, default=None)
