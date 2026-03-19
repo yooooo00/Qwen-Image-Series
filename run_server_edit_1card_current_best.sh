@@ -37,5 +37,6 @@ python server_edit_1card_current_best.py \
     --num_inference_steps 8 \
     --width 1024 \
     --height 1024 \
+    --target_infer_area 1048576 \
     --max_infer_area 1048576 \
     --device_id 0

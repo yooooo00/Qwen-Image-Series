@@ -130,6 +130,23 @@ def _resolve_infer_size(
     return infer_width, infer_height, True
 
 
+def _calculate_target_area_dimensions(
+    width: int,
+    height: int,
+    target_infer_area: int,
+    multiple: int = 32,
+) -> tuple[int, int, bool]:
+    if target_infer_area <= 0:
+        return width, height, False
+
+    ratio = width / height
+    infer_width = math.sqrt(target_infer_area * ratio)
+    infer_height = infer_width / ratio
+    infer_width = max(int(round(infer_width / multiple) * multiple), multiple)
+    infer_height = max(int(round(infer_height / multiple) * multiple), multiple)
+    return infer_width, infer_height, True
+
+
 def _parse_image_entries(raw: Dict[str, Any]) -> List[str]:
     if "images" in raw:
         images = raw["images"]
@@ -177,6 +194,10 @@ class QwenEditSingleCardService:
             raise ValueError("max_infer_area must be >= 0")
         if self.args.max_infer_area not in (None, 0) and self.args.max_infer_area < 16 * 16:
             raise ValueError("max_infer_area must be 0 or >= 256")
+        if self.args.target_infer_area is not None and self.args.target_infer_area < 0:
+            raise ValueError("target_infer_area must be >= 0")
+        if self.args.target_infer_area not in (None, 0) and self.args.target_infer_area < 32 * 32:
+            raise ValueError("target_infer_area must be 0 or >= 1024")
         for name in ("max_infer_width", "max_infer_height"):
             value = getattr(self.args, name)
             if value is not None and value < 0:
@@ -270,19 +291,25 @@ class QwenEditSingleCardService:
         if cfg_scale <= 0 or guidance_scale <= 0:
             raise ValueError("cfg_scale and guidance_scale must be > 0")
 
-        infer_width, infer_height, size_limited = _resolve_infer_size(
+        preferred_width, preferred_height, used_target_area = _calculate_target_area_dimensions(
             width,
             height,
+            self.args.target_infer_area,
+        )
+        infer_width, infer_height, threshold_limited = _resolve_infer_size(
+            preferred_width,
+            preferred_height,
             self.args.max_infer_area,
             self.args.max_infer_width,
             self.args.max_infer_height,
         )
+        size_limited = used_target_area or threshold_limited
         image_entries = _parse_image_entries(raw)
         images = self._load_images_from_entries(image_entries)
         if size_limited:
             logging.info(
                 f"Request size limited from {width}x{height} to {infer_width}x{infer_height} "
-                f"(max_infer_area={self.args.max_infer_area}, "
+                f"(target_infer_area={self.args.target_infer_area}, max_infer_area={self.args.max_infer_area}, "
                 f"max_infer_width={self.args.max_infer_width}, max_infer_height={self.args.max_infer_height})"
             )
 
@@ -469,6 +496,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num_inference_steps", type=int, default=8)
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--height", type=int, default=1024)
+    parser.add_argument("--target_infer_area", type=int, default=0)
     parser.add_argument("--max_infer_area", type=int, default=0)
     parser.add_argument("--max_infer_width", type=int, default=0)
     parser.add_argument("--max_infer_height", type=int, default=0)
